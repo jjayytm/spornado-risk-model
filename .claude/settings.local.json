@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe --version)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(.venv/Scripts/python -m pytest tests/ -v --tb=short)",
+      "Bash(.venv\\\\Scripts\\\\python -m pytest tests/ -v --tb=short)",
+      "Bash(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import src.predict; print\\('predict OK'\\)\")",
+      "Bash(python -c ' *)",
+      "Bash(.venv/Scripts/python.exe notebooks/_build_nb02.py)",
+      "Bash(.venv/Scripts/python.exe -m pytest tests/ -v --tb=short -q)",
+      "Bash(timeout 30 .venv/Scripts/python.exe -m pytest tests/test_features.py -v --collect-only)",
+      "Bash(taskkill /F /IM python.exe /T)",
+      "Bash(pkill -f pytest)",
+      "Bash(pkill -f \"python.exe.*pytest\")",
+      "Bash(timeout 20 .venv/Scripts/python.exe -m pytest tests/test_features.py --collect-only)",
+      "Bash(timeout 10 .venv/Scripts/python.exe -c \"from src.features import TARGET_COL; print\\('OK'\\)\")",
+      "Bash(timeout 5 .venv/Scripts/python.exe -c \"print\\('hello'\\)\")",
+      "Bash(timeout 10 .venv/Scripts/python.exe -c \"import pandas; print\\('pandas OK'\\)\")"
+    ]
+  }
+}

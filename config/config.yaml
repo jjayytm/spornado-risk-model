@@ -1,0 +1,125 @@
+# Spornado Disease Risk Model — Master Configuration
+# All scripts load this via src/config_loader.py
+# Paths are relative to the project root (directory containing this config/ folder).
+
+paths:
+  data_merged:   data/raw/spornado_weather_spore_data.csv  # output of build_weather_spore_data.py
+  data_raw_xlsx: data/raw/All data.xlsx
+  data_raw_csv:  data/raw/More Data.csv
+  weather_dir:   data/weather          # directory of per-location weather_<lat>_<lon>.csv files
+  tolerance_dir: data/processed        # corn/soybean/potato disease tolerance CSVs
+  models_dir:    models
+  logs_dir:      logs
+
+# Crops to build models for (must match 'Crop type' values in the raw data after title-casing)
+crops:
+  - Corn
+  - Soybean
+  - Potato
+
+data:
+  test_size:              0.2    # chronological hold-out fraction
+  min_samples_per_crop:   100
+  random_state:           42
+  weather_match_max_km:   15.0   # nearest-weather search radius in kilometres
+
+features:
+  # Weather columns produced by build_weather_spore_data.py
+  weather:
+    - temperature_min_c
+    - temperature_max_c
+    - temperature_mean_c
+    - humidity_max_percent
+    - precipitation_mm
+    - wind_speed_max_kmh
+    - dew_point_min_c
+
+  # Date-derived features
+  temporal:
+    - month
+    - day_of_year
+    - week_of_year
+
+  # Rolling statistics computed per-location over the N most recent trap deployments.
+  # Applied to each column in rolling_base_cols → generates <col>_roll<N>mean / _roll<N>max.
+  rolling_windows:    [3, 5, 7]
+  rolling_base_cols:
+    - temperature_max_c
+    - humidity_max_percent
+    - precipitation_mm
+    - dew_point_min_c
+
+  # NOTE: Spore count is intentionally excluded — it determines the test result
+  # and therefore the target label (data leakage). The model must predict risk
+  # from environmental features alone so it is useful *before* a trap is read.
+
+model:
+  type:         LogisticRegression
+  class_weight: balanced     # handles positive/negative class imbalance
+  max_iter:     1000
+  random_state: 42
+  solver:       lbfgs
+  cv_folds:     5            # TimeSeriesSplit folds used on the training set
+  n_jobs:       1            # parallel CV workers; set to -1 on a multi-core server
+
+  # ── Recall-constrained threshold tuning ──────────────────────────────────────
+  # In agriculture False Negatives (missed outbreaks) cost a crop; False
+  # Positives (unnecessary spray) cost money but are survivable.  Rather than a
+  # heuristic multiplier, the threshold is set by directly expressing the
+  # business requirement as a recall floor:
+  #
+  #   "Catch at least min_recall × 100 % of real disease outbreaks."
+  #
+  # The algorithm (precision_recall_curve) then finds the highest threshold that
+  # still meets that floor, which maximises precision (fewest false alarms)
+  # subject to the recall constraint.
+  #
+  # Threshold anatomy (example: min_recall=0.90, corn model):
+  #
+  #   0.0 ──────── low_max ──────── optimal ──────────────── 1.0
+  #     LOW (safe)   │   MEDIUM (uncertain)  │   HIGH (alert)
+  #                  │                       │
+  #            optimal × 0.70         recall-constrained
+  #                                   decision boundary
+  #
+  # min_recall      : fraction of true outbreaks the model MUST catch.
+  #                   0.90 → "miss at most 1 in 10 outbreaks".
+  #                   0.95 → "miss at most 1 in 20 outbreaks" (more false alarms).
+  #                   VALIDATE with agronomist / crop protection specialist.
+  #                   Recommended starting point: 0.90.
+  # medium_band_factor : MEDIUM band occupies [optimal × factor, optimal).
+  #                   0.70 means the uncertain zone is the bottom 30 % of the
+  #                   decision threshold.
+  min_recall:          0.90
+  medium_band_factor:  0.70
+
+variety_matching:
+  fuzzy_threshold:  80       # fuzz.token_set_ratio minimum score (0–100)
+  rating_scale_max: 9        # disease tolerance scale (1 = resistant, 9 = susceptible)
+
+output:
+  model_results:     models/model_performance_results.csv
+  variety_results:   models/model_performance_results_with_variety.csv
+  integrated_data:   data/processed/spornado_with_variety_features.csv
+
+logging:
+  level:  INFO               # DEBUG | INFO | WARNING | ERROR | CRITICAL
+  format: "%(asctime)s  %(name)-30s  %(levelname)-8s  %(message)s"
+  file:   logs/spornado.log
+
+# Optional: PostgreSQL backend (disabled by default)
+database:
+  enabled:  false
+  type:     postgresql
+  host:     localhost
+  port:     5432
+  database: spornado
+  # Credentials via environment variables: DB_USER, DB_PASSWORD
+
+# Optional: REST prediction API (disabled by default)
+api:
+  enabled:    false
+  host:       0.0.0.0
+  port:       5000
+  debug:      false
+  batch_size: 100

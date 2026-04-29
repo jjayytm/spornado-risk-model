@@ -1,0 +1,114 @@
+# Environment & Virtual Environments
+venv/
+env/
+ENV/
+.venv
+.env
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# IDE & Editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.sublime-project
+.sublime-workspace
+
+# Jupyter Notebooks — keep *.ipynb in version control; ignore only runtime cache
+.ipynb_checkpoints/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Logs
+*.log
+logs/
+*.txt.log
+
+# Data Files (keep structure, exclude large files)
+data/raw/*.csv
+data/raw/*.xlsx
+data/raw/*.json
+data/processed/*.csv
+!data/processed/corn_disease_tolerance.csv
+!data/processed/soybean_disease_tolerance.csv
+!data/processed/potato_disease_tolerance.csv
+
+# Model Files — binaries and generated results excluded; keep .gitkeep
+models/*.pkl
+models/*.joblib
+models/*.csv
+models/*.h5
+*.pth
+*.onnx
+
+# Temporary Files
+*.tmp
+*.bak
+*.backup
+*~
+.tmp/
+
+# OS
+Thumbs.db
+.DS_Store
+ehthumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Local Configuration
+local_config.yaml
+secrets.yaml
+.env.local
+
+# Office documents — keep locally, never commit to GitHub
+*.docx
+*.doc
+*.xlsx
+*.xls
+*.pptx
+*.ppt
+
+# Large Files (use Git LFS for these)
+*.zip
+*.tar.gz
+*.rar
+
+# Cache
+.cache/
+**/cache/

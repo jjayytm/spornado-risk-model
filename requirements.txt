@@ -1,0 +1,30 @@
+# ── Core: data science & ML ─────────────────────────────────────────────────
+pandas>=2.2
+numpy>=1.26
+scikit-learn>=1.5      # includes joblib as a dependency
+scipy>=1.13
+joblib>=1.4            # model serialisation (explicit pin; ships with scikit-learn)
+
+# ── Visualisation ────────────────────────────────────────────────────────────
+matplotlib>=3.9
+seaborn>=0.13
+
+# ── Configuration ────────────────────────────────────────────────────────────
+pyyaml>=6.0
+
+# ── Notebooks ────────────────────────────────────────────────────────────────
+jupyterlab>=4.2
+notebook>=7.2
+ipykernel>=6.29,<7
+jupyter_client>=8.6
+pyzmq>=26
+tornado>=6.4
+
+# ── Variety pipeline (optional — needed only for Phase 2 variety features) ───
+pdfplumber>=0.11       # PDF extraction  (src/extract_pdf_to_csv.py)
+PyPDF2>=3.0            # PDF metadata fallback
+fuzzywuzzy>=0.18       # variety name fuzzy matching
+python-Levenshtein>=0.25  # speeds up fuzzywuzzy
+
+# ── Development & testing ────────────────────────────────────────────────────
+pytest>=8.2
