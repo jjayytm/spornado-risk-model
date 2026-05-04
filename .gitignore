@@ -95,6 +95,8 @@ ehthumbs.db
 local_config.yaml
 secrets.yaml
 .env.local
+.claude/
+.ipython/profile_default/startup/
 
 # Local-only PDFs in docs/ (repo tracks Disease_Risk_Thresholds_Methodology.pdf only)
 docs/spornado scope.pdf
