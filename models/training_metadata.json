@@ -1,0 +1,14 @@
+{
+  "training_file": "C:\\Users\\Admin\\Desktop\\RnD\\spornado_risk_model\\data\\raw\\spornado_weather_spore_data.csv",
+  "md5_hash": "b75ec3d81296aea016e4a5e83a473f9f",
+  "row_count": 3784,
+  "col_count": 26,
+  "trained_at": "2026-05-04T02:39:17+00:00",
+  "model_type": "XGBoost",
+  "min_recall": 0.9,
+  "crops_trained": [
+    "Corn",
+    "Soybean",
+    "Wheat"
+  ]
+}

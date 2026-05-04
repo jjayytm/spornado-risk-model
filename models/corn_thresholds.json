@@ -1,0 +1,38 @@
+{
+  "crop": "Corn",
+  "model": "temporal",
+  "feature_set": "temporal + deployment_duration + disease (all rows)",
+  "data_subset": "all rows",
+  "n_features": 9,
+  "temporal_features": [
+    "month",
+    "day_of_year",
+    "week_of_year"
+  ],
+  "duration_features": [
+    "deployment_duration_days"
+  ],
+  "disease_features": [
+    "disease_gibberella_ear_rot",
+    "disease_gray_leaf_spot",
+    "disease_northern_corn_leaf_blight",
+    "disease_southern_rust",
+    "disease_tar_spot"
+  ],
+  "calibrated": true,
+  "calibration_method": "isotonic",
+  "calibration_samples": 324,
+  "optimal": 0.3125,
+  "low_max": 0.2188,
+  "low_max_source": "factor_fallback",
+  "precision_floor_used": 0.99,
+  "base_rate": 0.7654,
+  "high_min": 0.3125,
+  "achieved_recall": 0.9839,
+  "achieved_precision": 0.7761,
+  "min_recall_target": 0.9,
+  "recall_shortfall": false,
+  "youden": 0.9091,
+  "medium_band_factor": 0.7,
+  "derivation": "Recall-constrained: >=90% recall (achieved 98.4%) with max precision (77.6%) on all-rows chronological hold-out. MEDIUM low_max from factor_fallback."
+}

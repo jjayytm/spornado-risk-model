@@ -1,0 +1,36 @@
+{
+  "crop": "Wheat",
+  "model": "temporal",
+  "feature_set": "temporal + deployment_duration + disease (all rows)",
+  "data_subset": "all rows",
+  "n_features": 7,
+  "temporal_features": [
+    "month",
+    "day_of_year",
+    "week_of_year"
+  ],
+  "duration_features": [
+    "deployment_duration_days"
+  ],
+  "disease_features": [
+    "disease_fusarium_head_blight",
+    "disease_septoria_tritici_leaf_blotch",
+    "disease_stripe_rust"
+  ],
+  "calibrated": true,
+  "calibration_method": "isotonic",
+  "calibration_samples": 51,
+  "optimal": 0.875,
+  "low_max": 0.6125,
+  "low_max_source": "factor_fallback",
+  "precision_floor_used": 0.99,
+  "base_rate": 0.6875,
+  "high_min": 0.875,
+  "achieved_recall": 0.9545,
+  "achieved_precision": 0.9767,
+  "min_recall_target": 0.9,
+  "recall_shortfall": false,
+  "youden": 0.875,
+  "medium_band_factor": 0.7,
+  "derivation": "Recall-constrained: >=90% recall (achieved 95.5%) with max precision (97.7%) on all-rows chronological hold-out. MEDIUM low_max from factor_fallback."
+}

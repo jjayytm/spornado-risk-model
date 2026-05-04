@@ -67,6 +67,14 @@ WEATHER_COLS: List[str] = [
     "dew_point_min_c",
 ]
 
+# Identity / location features — numeric, no scaling required for tree models.
+# Always included when present in the data; NaN-safe via the median imputer.
+IDENTITY_NUMERIC_COLS: List[str] = [
+    "gps_latitude",
+    "gps_longitude",
+    "deployment_duration_days",
+]
+
 TARGET_COL = "disease_present"
 
 
@@ -124,6 +132,148 @@ def add_temporal_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def add_deployment_duration(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute trap deployment duration in calendar days (end_date - start_date).
+
+    Agronomic rationale
+    -------------------
+    A trap deployed for 14 days samples a broader weather window and accumulates
+    more spores than one deployed for 5 days.  Duration is therefore an
+    independent signal that is always available (start_date and end_date come
+    from the trap record, not from GPS), making it suitable for both the full
+    weather model and the temporal fallback.
+
+    NaN is set when either date is missing — the downstream median imputer
+    handles this without dropping the row.
+    """
+    df = df.copy()
+    if "start_date" not in df.columns or "end_date" not in df.columns:
+        logger.warning(
+            "Cannot compute deployment_duration_days — start_date or end_date missing."
+        )
+        df["deployment_duration_days"] = np.nan
+        return df
+
+    duration = (df["end_date"] - df["start_date"]).dt.days
+    df["deployment_duration_days"] = pd.to_numeric(duration, errors="coerce")
+
+    n_valid = int(df["deployment_duration_days"].notna().sum())
+    if n_valid > 0:
+        logger.info(
+            "Deployment duration: %d valid rows  (mean %.1f d | min %g d | max %g d).",
+            n_valid,
+            df["deployment_duration_days"].mean(),
+            df["deployment_duration_days"].min(),
+            df["deployment_duration_days"].max(),
+        )
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Data quality & availability guards
+# ---------------------------------------------------------------------------
+
+def filter_corrupted_dates(
+    df: pd.DataFrame,
+    min_year: int = 2010,
+    max_year: int = 2030,
+) -> pd.DataFrame:
+    """
+    Drop rows whose ``start_date`` falls outside [min_year, max_year].
+
+    Why this matters
+    ----------------
+    Excel date serials can silently produce nonsense dates such as year 0204
+    or 1900 when the underlying cell contains a formula error or a legacy
+    two-digit-year.  ``pd.to_datetime`` happily parses them without raising —
+    they then corrupt rolling statistics (mis-sorted time windows) and leak
+    through the chronological train/test split as phantom early observations.
+
+    Rows with a NaT start_date are kept as-is; they are handled downstream
+    by the NaN-feature drop.
+
+    Parameters
+    ----------
+    min_year, max_year : int
+        Valid date range.  Configure in config.yaml under data.valid_year_min
+        and data.valid_year_max.
+    """
+    if "start_date" not in df.columns:
+        return df
+
+    before = len(df)
+    year   = df["start_date"].dt.year
+    valid  = year.between(min_year, max_year, inclusive="both") | df["start_date"].isna()
+    df     = df[valid].reset_index(drop=True)
+
+    dropped = before - len(df)
+    if dropped:
+        logger.warning(
+            "Dropped %d rows with start_date outside [%d, %d] "
+            "(likely corrupted Excel date serials).",
+            dropped, min_year, max_year,
+        )
+    return df
+
+
+def flag_weather_availability(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add a boolean column ``weather_available``: True only when all required
+    weather columns contain real (non-NaN) values for that row.
+
+    Two-model training rationale
+    ----------------------------
+    The merged dataset contains rows from two fundamentally different sources:
+
+    1. **CSV rows (GPS-enabled)** — each trap has GPS coordinates; the pipeline
+       matched a nearby weather station and populated the weather columns with
+       real, location-specific observations.
+
+    2. **XLSX rows (no GPS)** — trap records exported without coordinates; no
+       weather station could be matched, so all seven weather columns are NaN.
+
+    Filling XLSX weather NaNs with the cross-location mean (what SimpleImputer
+    does by default) is agronomically meaningless: "average temperature across
+    all farms in the dataset" carries zero signal for a specific trap's disease
+    risk.  Using those imputed rows in the weather model would dilute the signal
+    and produce misleading feature importances.
+
+    ``build_crop_models.py`` uses this flag to train two separate per-crop models:
+
+    - ``_model_weather.pkl``  — GPS rows only, full weather + temporal features
+                                (XGBoost; captures nonlinear weather interactions)
+    - ``_model.pkl``          — ALL rows, temporal features only
+                                (LogisticRegression; 3 features, no imputation noise)
+
+    ``predict.py`` enforces the same policy at inference time: weather/variety
+    models require complete weather inputs.  This keeps train/inference policy
+    aligned and avoids routing partial-weather rows into the full-triangle path.
+    """
+    present = [c for c in WEATHER_COLS if c in df.columns]
+    df      = df.copy()
+
+    if not present:
+        logger.warning(
+            "No weather columns found in DataFrame — 'weather_available' will be "
+            "False for all rows.  Check that build_weather_spore_data.py ran first."
+        )
+        df["weather_available"] = False
+        return df
+
+    # Full-triangle consistency: require complete weather feature vector.
+    df["weather_available"] = df[present].notna().all(axis=1)
+
+    n_with    = int(df["weather_available"].sum())
+    n_without = len(df) - n_with
+    logger.info(
+        "Weather availability: %d rows have GPS-matched weather data, "
+        "%d rows do not (no GPS coordinates).",
+        n_with, n_without,
+    )
+    return df
+
+
 def add_rolling_weather_features(
     df: pd.DataFrame,
     base_cols: List[str],
@@ -178,12 +328,28 @@ def build_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     columns (crop_type, start_date, location_ref) needed for splitting.
     """
     feat_cfg = cfg["features"]
+    data_cfg = cfg.get("data", {})
 
     df = normalise_columns(df)
     df = parse_dates(df)
+
+    # ── Date quality guard ────────────────────────────────────────────────────
+    # Must run BEFORE temporal features so rolling windows are not mis-sorted
+    # by phantom years like 0204 that slip through pd.to_datetime silently.
+    min_year = data_cfg.get("valid_year_min", 2010)
+    max_year = data_cfg.get("valid_year_max", 2030)
+    df = filter_corrupted_dates(df, min_year, max_year)
+
     df = encode_target(df)
     df = coerce_weather_to_numeric(df)
+
+    # ── Weather availability flag ─────────────────────────────────────────────
+    # Must run BEFORE rolling stats so the flag reflects raw GPS-match status,
+    # not the imputed values (which would make every row look "available").
+    df = flag_weather_availability(df)
+
     df = add_temporal_features(df)
+    df = add_deployment_duration(df)
     df = add_rolling_weather_features(
         df,
         base_cols=feat_cfg["rolling_base_cols"],
@@ -201,17 +367,46 @@ def build_features(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     return df
 
 
+def get_temporal_feature_columns(cfg: dict) -> List[str]:
+    """
+    Return only the temporal feature columns (month, day_of_year, week_of_year).
+
+    These columns are derived from the trap date and are available for *every*
+    row regardless of GPS or weather-station coverage.  They are the feature set
+    used by ``_model.pkl`` — the temporal-only fallback trained on all rows.
+
+    Parameters
+    ----------
+    cfg : dict
+        Config loaded by src.config_loader.load().
+    """
+    return list(cfg["features"].get("temporal", ["month", "day_of_year", "week_of_year"]))
+
+
 def get_feature_columns(cfg: dict, df: pd.DataFrame) -> List[str]:
     """
-    Return the ordered list of feature column names that exist in *df*.
+    Return the ordered list of *numeric* feature column names that exist in *df*.
 
-    The order is: weather → temporal → rolling derived.
-    Missing columns are warned about but not raised as errors so that
-    partial-weather datasets (e.g., rows without a weather match) degrade
-    gracefully.
+    Column order
+    ------------
+    weather  →  identity/location  →  temporal  →  rolling derived
+
+    Notes
+    -----
+    * Disease dummies (from the 'test' column) are NOT included here — they
+      are computed per-crop inside build_crop_models.py after the crop filter
+      and appended to the list returned by this function.
+    * Location columns (gps_latitude, gps_longitude) are NaN for non-GPS rows;
+      the downstream median imputer handles them without dropping rows.
+    * deployment_duration_days is always included when present.
+    * Missing columns are warned about but not raised as errors so that
+      partial-weather datasets degrade gracefully.
     """
     feat_cfg = cfg["features"]
-    base = feat_cfg["weather"] + feat_cfg["temporal"]
+
+    weather  = feat_cfg.get("weather", [])
+    identity = feat_cfg.get("identity", [])   # lat, lon, duration
+    temporal = feat_cfg.get("temporal", [])
 
     rolling_derived: List[str] = []
     for col in feat_cfg["rolling_base_cols"]:
@@ -219,8 +414,8 @@ def get_feature_columns(cfg: dict, df: pd.DataFrame) -> List[str]:
             rolling_derived.append(f"{col}_roll{w}mean")
             rolling_derived.append(f"{col}_roll{w}max")
 
-    all_features = base + rolling_derived
-    available = [f for f in all_features if f in df.columns]
+    all_features = weather + identity + temporal + rolling_derived
+    available    = [f for f in all_features if f in df.columns]
 
     missing = set(all_features) - set(available)
     if missing:

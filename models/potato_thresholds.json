@@ -1,0 +1,16 @@
+{
+  "crop": "Potato",
+  "model": "temporal",
+  "feature_set": "temporal only (month, day_of_year, week_of_year)",
+  "data_subset": "all rows",
+  "optimal": 0.4221,
+  "low_max": 0.2955,
+  "high_min": 0.4221,
+  "achieved_recall": 1.0,
+  "achieved_precision": 0.4738,
+  "min_recall_target": 0.9,
+  "recall_shortfall": false,
+  "youden": 0.4981,
+  "medium_band_factor": 0.7,
+  "derivation": "Recall-constrained: \u226590% recall (achieved 100.0%) with max precision (47.4%) on all-rows chronological hold-out."
+}

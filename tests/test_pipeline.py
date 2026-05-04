@@ -4,45 +4,47 @@ Tests for the data pipeline utilities in build_weather_spore_data.py.
 Run: pytest tests/test_pipeline.py -v
 """
 
-import math
-
 import pytest
 
 from src.build_weather_spore_data import (
     clean_coord,
-    clean_gps,
     clean_spore_count,
-    excel_serial_to_date,
     find_nearest,
     haversine_km,
+    normalize_date,
 )
 from src.build_crop_models import temporal_train_test_split
 import pandas as pd
 
 
 # ---------------------------------------------------------------------------
-# excel_serial_to_date
+# normalize_date
 # ---------------------------------------------------------------------------
 
-class TestExcelSerialToDate:
-    def test_known_date(self):
-        # Excel serial 45292 → 2024-01-01
-        result = excel_serial_to_date("45292")
+class TestNormalizeDate:
+    def test_iso_date(self):
+        result = normalize_date("2024-01-01")
         assert result == "2024-01-01"
 
-    def test_non_numeric_returned_as_is(self):
-        result = excel_serial_to_date("2024-06-01")
-        assert result == "2024-06-01"
+    def test_us_date(self):
+        result = normalize_date("2/1/2026")
+        assert result == "2026-02-01"
 
-    def test_empty_string_returned_as_is(self):
-        result = excel_serial_to_date("")
+    def test_us_date_with_time_suffix(self):
+        result = normalize_date("9/25/2025 12:00")
+        assert result == "2025-09-25"
+
+    def test_two_digit_year(self):
+        result = normalize_date("02/01/26")
+        assert result == "2026-02-01"
+
+    def test_empty_string(self):
+        result = normalize_date("")
         assert result == ""
 
-    def test_leap_year_bug_correction(self):
-        # Serial 60 would be 1900-02-29, which doesn't exist.
-        # Our correction shifts serials > 59 by -1.
-        result = excel_serial_to_date("61")
-        assert result == "1900-03-01"
+    def test_invalid_returns_empty(self):
+        result = normalize_date("not-a-date")
+        assert result == ""
 
 
 # ---------------------------------------------------------------------------
@@ -79,21 +81,6 @@ class TestCleanSporeCount:
 
     def test_none_or_empty(self):
         assert clean_spore_count("") == ""
-
-
-# ---------------------------------------------------------------------------
-# clean_gps
-# ---------------------------------------------------------------------------
-
-class TestCleanGps:
-    def test_strips_apostrophe(self):
-        assert clean_gps("'-81.68") == "-81.68"
-
-    def test_plain_string_unchanged(self):
-        assert clean_gps("43.52") == "43.52"
-
-    def test_empty_string(self):
-        assert clean_gps("") == ""
 
 
 # ---------------------------------------------------------------------------
