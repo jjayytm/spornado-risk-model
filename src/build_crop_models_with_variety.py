@@ -24,13 +24,6 @@ import joblib
 import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import (
-    classification_report,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
 from sklearn.model_selection import TimeSeriesSplit, cross_validate
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -38,7 +31,7 @@ from sklearn.preprocessing import StandardScaler
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 
-from src.build_crop_models import temporal_train_test_split
+from src.build_crop_models import evaluate_crop, temporal_train_test_split
 from src.config_loader import load as load_config
 from src.features import TARGET_COL, build_features, get_feature_columns
 
@@ -106,7 +99,6 @@ class VarietyAwareModelBuilder:
 
     def _evaluate(
         self,
-        pipe: Pipeline,
         X_train: pd.DataFrame,
         y_train: pd.Series,
         X_test: pd.DataFrame,
@@ -114,9 +106,16 @@ class VarietyAwareModelBuilder:
         cv_folds: int,
         crop: str,
     ) -> tuple[Pipeline, dict]:
+        """
+        Leakage-safe evaluation:
+        - CV on X_train only
+        - threshold tuning on train-only chronological window
+        - untouched hold-out test metrics at pre-tuned threshold
+        """
         cv = TimeSeriesSplit(n_splits=cv_folds)   # preserves temporal order; no CV leakage
+        cv_pipe = self._build_pipeline()
         cv_res = cross_validate(
-            pipe, X_train, y_train,
+            cv_pipe, X_train, y_train,
             cv=cv,
             scoring=["roc_auc", "f1", "precision", "recall"],
             return_train_score=False,
@@ -129,64 +128,34 @@ class VarietyAwareModelBuilder:
             cv_res["test_f1"].mean(),       cv_res["test_f1"].std(),
         )
 
-        pipe.fit(X_train, y_train)
-        y_proba = pipe.predict_proba(X_test)[:, 1]
-
-        # Recall-constrained threshold — identical logic as build_crop_models.py
-        from src.build_crop_models import find_optimal_threshold
-        thresholds = find_optimal_threshold(
-            y_test, y_proba,
+        # Use the shared leakage-safe evaluator so variety path stays aligned
+        # with the main training protocol.
+        pipe, metrics, _ = evaluate_crop(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            model_cfg={
+                "type": "LogisticRegression",
+                "class_weight": self._cfg["model"]["class_weight"],
+                "max_iter": self._cfg["model"]["max_iter"],
+                "random_state": self._cfg["model"]["random_state"],
+                "solver": self._cfg["model"]["solver"],
+                "n_jobs": self._cfg["model"].get("n_jobs", 1),
+            },
+            cv_folds=cv_folds,
+            crop=crop,
+            n_jobs=self._cfg["model"].get("n_jobs", 1),
             min_recall=self._cfg["model"].get("min_recall", 0.90),
             medium_band_factor=self._cfg["model"].get("medium_band_factor", 0.70),
+            calibration_cfg=self._cfg["model"].get("calibration", {}),
         )
-
-        # Metrics computed at the deployment threshold (not default 0.5)
-        y_pred    = (y_proba >= thresholds["optimal"]).astype(int)
-        test_auc  = roc_auc_score(y_test, y_proba)
-        test_f1   = f1_score(y_test, y_pred, zero_division=0)
-        test_prec = precision_score(y_test, y_pred, zero_division=0)
-        test_rec  = recall_score(y_test, y_pred, zero_division=0)
-
-        logger.info(
-            "  Hold-out @ threshold=%.4f  AUC: %.4f  F1: %.4f  "
-            "Precision: %.4f  Recall: %.4f",
-            thresholds["optimal"], test_auc, test_f1, test_prec, test_rec,
-        )
-        logger.info(
-            "  Recall target %.0f%%  →  achieved %.1f%%  |  Precision %.1f%%  "
-            "|  Bands: LOW<%.3f | MEDIUM[%.3f,%.3f) | HIGH≥%.3f  (Youden ref: %.3f)",
-            thresholds["min_recall_target"] * 100,
-            thresholds["achieved_recall"]   * 100,
-            thresholds["achieved_precision"] * 100,
-            thresholds["low_max"],
-            thresholds["low_max"], thresholds["high_min"],
-            thresholds["high_min"],
-            thresholds["youden"],
-        )
-        logger.info(
-            "  Classification report (threshold=%.4f):\n%s",
-            thresholds["optimal"],
-            classification_report(y_test, y_pred, zero_division=0),
-        )
-
-        return pipe, {
-            "cv_auc_mean":                  float(cv_res["test_roc_auc"].mean()),
-            "cv_auc_std":                   float(cv_res["test_roc_auc"].std()),
-            "cv_f1_mean":                   float(cv_res["test_f1"].mean()),
-            "test_auc":                     float(test_auc),
-            "test_f1":                      float(test_f1),
-            "test_precision":               float(test_prec),
-            "test_recall":                  float(test_rec),
-            "threshold_optimal":            thresholds["optimal"],
-            "threshold_low_max":            thresholds["low_max"],
-            "threshold_high_min":           thresholds["high_min"],
-            "threshold_achieved_recall":    thresholds["achieved_recall"],
-            "threshold_achieved_precision": thresholds["achieved_precision"],
-            "threshold_min_recall_target":  thresholds["min_recall_target"],
-            "threshold_recall_shortfall":   thresholds["recall_shortfall"],
-            "threshold_youden":             thresholds["youden"],
-            "threshold_medium_band_factor": thresholds["medium_band_factor"],
-        }
+        # Keep externally reported CV fields from this function's explicit CV run.
+        metrics["cv_auc_mean"] = float(cv_res["test_roc_auc"].mean())
+        metrics["cv_auc_std"] = float(cv_res["test_roc_auc"].std())
+        metrics["cv_f1_mean"] = float(cv_res["test_f1"].mean())
+        metrics["cv_f1_std"] = float(cv_res["test_f1"].std())
+        return pipe, metrics
 
     def build_all_models(self, data_path: str) -> pd.DataFrame:
         cfg         = self._cfg
@@ -248,9 +217,8 @@ class VarietyAwareModelBuilder:
                 logger.warning("  Skipping — test split has only one class.")
                 continue
 
-            pipe  = self._build_pipeline()
             pipe, metrics = self._evaluate(
-                pipe, X_train, y_train, X_test, y_test,
+                X_train, y_train, X_test, y_test,
                 cv_folds=cfg["model"]["cv_folds"],
                 crop=crop,
             )
@@ -276,7 +244,7 @@ class VarietyAwareModelBuilder:
                     f"Recall-constrained (variety model): threshold chosen to achieve "
                     f">={metrics['threshold_min_recall_target']*100:.0f}% recall "
                     f"(achieved {metrics['threshold_achieved_recall']*100:.1f}%) "
-                    f"on chronological hold-out test set."
+                    f"on train-only chronological threshold-tuning window."
                 ),
             }, indent=2), encoding="utf-8")
 

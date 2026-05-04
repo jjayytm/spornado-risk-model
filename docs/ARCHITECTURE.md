@@ -194,6 +194,114 @@ Deploy if Validated
 
 ---
 
+## Two-Model Training Strategy
+
+> **Implemented:** `src/features.py`, `src/build_crop_models.py`, `src/predict.py`
+
+### The Problem: Two Fundamentally Different Datasets
+
+The merged CSV (`spornado_weather_spore_data.csv`) blends trap records from two
+structurally different sources:
+
+| Source | GPS? | Weather columns | Volume |
+|--------|------|-----------------|--------|
+| CSV export | ✅ Yes | Populated from nearest weather station (≤ 15 km) | ~60–70% of rows |
+| XLSX export | ❌ No | All `NaN` | ~30–40% of rows |
+
+Applying `SimpleImputer(strategy="mean")` to rows that have no GPS coordinates
+fills their seven weather columns with **the cross-location mean across all farms
+in the training set**.  That imputed value carries zero location-specific signal;
+a trap in Ontario gets the same "average temperature" as one in Saskatchewan.
+Training a weather-based model on those rows teaches the model spurious patterns:
+*"rows with mean-weather values have some outcome distribution"* — which says
+nothing about the actual climate at those locations.
+
+### The Solution: Train Two Separate Models Per Crop
+
+```
+For each crop:
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Step A (optional) — Logistic Regression BASELINE                    │
+  │   Data:     GPS rows only (weather_available == True)               │
+  │   Features: full set (weather + temporal + rolling)                 │
+  │   Purpose:  quantify XGBoost's uplift over LR                       │
+  │   Saved as: <crop>_model_baseline.pkl  (NOT used by predict.py)     │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Step B — WEATHER MODEL  (primary, production)                       │
+  │   Data:     GPS rows only (weather_available == True)               │
+  │   Features: full set (7 weather + 3 temporal + rolling statistics)  │
+  │   Model:    XGBoost (nonlinear weather interactions)                │
+  │   Saved as: <crop>_model_weather.pkl                                │
+  │             <crop>_weather_thresholds.json                          │
+  └─────────────────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────────────────┐
+  │ Step C — TEMPORAL FALLBACK MODEL                                    │
+  │   Data:     ALL rows (GPS + non-GPS)                                │
+  │   Features: temporal only (month, day_of_year, week_of_year)        │
+  │   Model:    LogisticRegression (3 features; LR is correct here)     │
+  │   Saved as: <crop>_model.pkl                                        │
+  │             <crop>_thresholds.json                                  │
+  └─────────────────────────────────────────────────────────────────────┘
+```
+
+**Why LogisticRegression for the temporal model?**  With only 3 features on a
+~3 k-row dataset, XGBoost offers no advantage.  LR converges faster, its
+coefficients are directly interpretable by agronomists ("each additional week
+into peak season increases log-odds by X"), and it does not overfit a thin
+feature space.
+
+### Inference-Time Routing (`src/predict.py`)
+
+`Predictor` selects model artifacts in priority order:
+
+```
+1. <crop>_model_variety.pkl   → <crop>_thresholds.json
+   (variety-aware, richest)
+
+2. <crop>_model_weather.pkl   → <crop>_weather_thresholds.json
+   (full weather features, GPS-trained)
+
+3. <crop>_model.pkl           → <crop>_thresholds.json
+   (temporal fallback only when weather/variety artifacts are absent)
+```
+
+The chosen threshold file is tracked in `Predictor._model_thr` so the correct
+JSON is loaded regardless of which model file was selected.
+In production, threshold JSON artifacts are required by default
+(`prediction.allow_threshold_fallback: false`).
+
+### Data Quality Guard: Corrupted Date Filtering
+
+`src/features.filter_corrupted_dates()` drops rows where `start_date` falls
+outside `[valid_year_min, valid_year_max]` (configured in `config.yaml`,
+defaults 2010–2030).
+
+This catches Excel date serials that silently parse to nonsense years (e.g.
+year **0204** from a two-digit-year cell, or **1900** from a formula error).
+Those rows corrupt rolling statistics (they sort as phantom-ancient events)
+and distort the chronological train/test split.
+
+The filter runs **before** temporal feature extraction and rolling windows so
+the bad rows can never influence any derived features.
+
+### Weather Availability Flag
+
+`src/features.flag_weather_availability()` adds a boolean column
+`weather_available` — `True` only when all required weather columns are present
+for that row.
+
+This flag is set **before** imputation so it reflects the raw GPS-match status,
+not the imputed values (which would make every row look available).
+`build_crop_models.py` uses this column to route rows into the correct training
+set without any file-path fragility. This policy is intentionally aligned with
+inference-time routing in `src/predict.py`.
+
+---
+
 ## Design Patterns
 
 ### 1. Modular Architecture

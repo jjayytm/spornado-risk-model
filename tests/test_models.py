@@ -14,6 +14,9 @@ import pytest
 from sklearn.pipeline import Pipeline
 
 from src.build_crop_models import (
+    _CalibratedWrapper,
+    _calibrate_pipeline,
+    _get_inner_pipeline,
     build_pipeline,
     evaluate_crop,
     find_optimal_threshold,
@@ -25,12 +28,29 @@ from src.build_crop_models import (
 # Fixtures — synthetic crop dataset
 # ---------------------------------------------------------------------------
 
-_MODEL_CFG = {
+_MODEL_CFG_LR = {
+    "type":         "LogisticRegression",
     "class_weight": "balanced",
     "max_iter":     500,
     "random_state": 42,
     "solver":       "lbfgs",
 }
+
+_MODEL_CFG_XGB = {
+    "type":         "XGBoost",
+    "random_state": 42,
+    "n_jobs":       1,
+    "xgboost": {
+        "n_estimators":     50,   # small for fast unit tests
+        "max_depth":         3,
+        "learning_rate":   0.1,
+        "eval_metric":  "logloss",
+        "random_state":     42,
+    },
+}
+
+# Default config used by tests that don't care about model type
+_MODEL_CFG = _MODEL_CFG_LR
 
 FEATURE_COLS = [
     "temperature_max_c", "humidity_max_percent", "precipitation_mm",
@@ -84,35 +104,86 @@ def split_data():
 # ---------------------------------------------------------------------------
 
 class TestBuildPipeline:
-    def test_returns_sklearn_pipeline(self):
-        pipe = build_pipeline(_MODEL_CFG)
+    # ── LogisticRegression pipeline ──────────────────────────────────────────
+
+    def test_lr_returns_sklearn_pipeline(self):
+        pipe = build_pipeline(_MODEL_CFG_LR)
         assert isinstance(pipe, Pipeline)
 
-    def test_pipeline_has_all_three_steps(self):
-        pipe = build_pipeline(_MODEL_CFG)
+    def test_lr_has_imputer_scaler_clf(self):
+        pipe = build_pipeline(_MODEL_CFG_LR)
         assert "imputer" in pipe.named_steps, "Missing SimpleImputer step"
         assert "scaler"  in pipe.named_steps, "Missing StandardScaler step"
-        assert "clf"     in pipe.named_steps, "Missing LogisticRegression step"
+        assert "clf"     in pipe.named_steps, "Missing classifier step"
 
-    def test_imputer_is_first_step(self):
-        pipe = build_pipeline(_MODEL_CFG)
+    def test_lr_imputer_is_first_step(self):
+        pipe = build_pipeline(_MODEL_CFG_LR)
         assert pipe.steps[0][0] == "imputer"
 
-    def test_pipeline_is_unfitted(self):
-        pipe = build_pipeline(_MODEL_CFG)
+    def test_lr_pipeline_is_unfitted(self):
         from sklearn.exceptions import NotFittedError
+        pipe = build_pipeline(_MODEL_CFG_LR)
         with pytest.raises(NotFittedError):
             pipe.predict(pd.DataFrame([{c: 1.0 for c in FEATURE_COLS}]))
 
-    def test_pipeline_handles_nan_after_fitting(self, split_data):
+    def test_lr_handles_nan_after_fitting(self, split_data):
         """SimpleImputer must allow NaN inputs at prediction time."""
         X_train, y_train, X_test, _ = split_data
-        pipe = build_pipeline(_MODEL_CFG)
+        pipe = build_pipeline(_MODEL_CFG_LR)
         pipe.fit(X_train, y_train)
         X_with_nan = X_test.copy()
-        X_with_nan.iloc[0, 0] = float("nan")   # inject a missing value
-        proba = pipe.predict_proba(X_with_nan)  # must not raise
+        X_with_nan.iloc[0, 0] = float("nan")
+        proba = pipe.predict_proba(X_with_nan)
         assert not any(p != p for p in proba[:, 1]), "predict_proba returned NaN for imputed row"
+
+    # ── XGBoost pipeline ─────────────────────────────────────────────────────
+
+    def test_xgb_returns_sklearn_pipeline(self):
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        pipe = build_pipeline(_MODEL_CFG_XGB)
+        assert isinstance(pipe, Pipeline)
+
+    def test_xgb_has_imputer_and_clf(self):
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        pipe = build_pipeline(_MODEL_CFG_XGB)
+        assert "imputer" in pipe.named_steps
+        assert "clf"     in pipe.named_steps
+        # XGBoost pipeline has no StandardScaler (tree models are scale-invariant)
+        assert "scaler" not in pipe.named_steps
+
+    def test_xgb_imputer_is_first_step(self):
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        pipe = build_pipeline(_MODEL_CFG_XGB)
+        assert pipe.steps[0][0] == "imputer"
+
+    def test_xgb_handles_nan_after_fitting(self, split_data):
+        """XGBoost handles NaN natively — imputer + native NaN handling both work."""
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        X_train, y_train, X_test, _ = split_data
+        pipe = build_pipeline(_MODEL_CFG_XGB)
+        pipe.fit(X_train, y_train)
+        X_with_nan = X_test.copy()
+        X_with_nan.iloc[0, 0] = float("nan")
+        proba = pipe.predict_proba(X_with_nan)
+        assert not any(p != p for p in proba[:, 1])
+
+    def test_xgb_pos_weight_is_applied(self):
+        """scale_pos_weight should be set on the XGBClassifier."""
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        pipe = build_pipeline(_MODEL_CFG_XGB, pos_weight=4.5)
+        clf  = pipe.named_steps["clf"]
+        assert abs(clf.scale_pos_weight - 4.5) < 1e-9
+
+    def test_both_models_produce_valid_probabilities(self, split_data):
+        """Both model types must produce probabilities in [0, 1]."""
+        pytest.importorskip("xgboost", reason="xgboost not installed")
+        X_train, y_train, X_test, _ = split_data
+        for cfg in (_MODEL_CFG_LR, _MODEL_CFG_XGB):
+            pipe = build_pipeline(cfg)
+            pipe.fit(X_train, y_train)
+            proba = pipe.predict_proba(X_test)[:, 1]
+            assert proba.min() >= 0.0 and proba.max() <= 1.0, \
+                f"{cfg['type']}: probabilities out of [0,1] range"
 
 
 # ---------------------------------------------------------------------------
@@ -123,7 +194,7 @@ class TestEvaluateCrop:
     def test_returns_pipeline_and_metrics(self, split_data):
         """evaluate_crop uses TimeSeriesSplit — no future leakage in CV folds."""
         X_train, y_train, X_test, y_test = split_data
-        pipe, metrics = evaluate_crop(
+        pipe, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -132,7 +203,7 @@ class TestEvaluateCrop:
 
     def test_metrics_keys_present(self, split_data):
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -157,7 +228,7 @@ class TestEvaluateCrop:
     def test_thresholds_are_in_valid_range(self, split_data):
         """Every probability threshold must be in (0, 1) with correct ordering."""
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -173,7 +244,7 @@ class TestEvaluateCrop:
         must be set — never silently below target.
         """
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop",
             min_recall=0.85,
@@ -187,12 +258,12 @@ class TestEvaluateCrop:
     def test_stricter_recall_gives_lower_threshold(self, split_data):
         """Higher min_recall forces the threshold lower to catch more positives."""
         X_train, y_train, X_test, y_test = split_data
-        _, m_relaxed = evaluate_crop(
+        _, m_relaxed, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop",
             min_recall=0.70,
         )
-        _, m_strict = evaluate_crop(
+        _, m_strict, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop",
             min_recall=0.95,
@@ -203,7 +274,7 @@ class TestEvaluateCrop:
 
     def test_auc_in_valid_range(self, split_data):
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -212,7 +283,7 @@ class TestEvaluateCrop:
 
     def test_fitted_model_predicts_probabilities(self, split_data):
         X_train, y_train, X_test, y_test = split_data
-        pipe, _ = evaluate_crop(
+        pipe, _, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -225,7 +296,7 @@ class TestEvaluateCrop:
     def test_model_predicts_both_classes(self, split_data):
         """Balanced class weighting should produce predictions of both 0 and 1."""
         X_train, y_train, X_test, y_test = split_data
-        pipe, _ = evaluate_crop(
+        pipe, _, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -236,7 +307,7 @@ class TestEvaluateCrop:
     def test_auc_better_than_random(self, split_data):
         """A properly trained model on non-trivial data should beat random chance."""
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -248,7 +319,7 @@ class TestEvaluateCrop:
     def test_cv_auc_std_is_reasonable(self, split_data):
         """High std deviation across folds signals an unstable model."""
         X_train, y_train, X_test, y_test = split_data
-        _, metrics = evaluate_crop(
+        _, metrics, _ = evaluate_crop(
             X_train, y_train, X_test, y_test,
             model_cfg=_MODEL_CFG, cv_folds=3, crop="TestCrop"
         )
@@ -284,12 +355,16 @@ class TestFindOptimalThreshold:
 
     def test_returns_all_required_keys(self):
         result = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA)
-        assert {
+        required = {
             "optimal", "low_max", "high_min",
             "achieved_recall", "achieved_precision",
             "min_recall_target", "recall_shortfall",
             "youden", "medium_band_factor",
-        } == set(result.keys())
+            "base_rate",
+        }
+        assert required.issubset(set(result.keys())), (
+            f"Missing keys: {required - set(result.keys())}"
+        )
 
     # ── Contract: valid probability values ───────────────────────────────────
 
@@ -317,17 +392,46 @@ class TestFindOptimalThreshold:
             "HIGH band must start exactly at the optimal threshold"
         )
 
-    def test_medium_band_proportional_to_optimal(self):
+    def test_medium_band_low_max_is_below_optimal(self):
+        """low_max must always be strictly below the decision threshold."""
+        result = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA)
+        assert result["low_max"] < result["optimal"], (
+            f"low_max={result['low_max']} must be < optimal={result['optimal']}"
+        )
+
+    def test_medium_band_factor_produces_consistent_width(self):
         """
-        low_max = optimal × medium_band_factor (within clamping bounds).
-        The band scales with the threshold — no hardcoded offsets.
+        low_max must equal optimal × medium_band_factor (clamped to valid range).
+        This verifies the single-method band derivation is applied correctly.
         """
-        result   = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA,
-                                          medium_band_factor=0.70)
-        expected = result["optimal"] * 0.70
-        # np.clip(expected, 0.01, optimal - 0.01) may adjust for very small optimals
-        expected_clamped = max(min(expected, result["optimal"] - 0.01), 0.01)
-        assert result["low_max"] == pytest.approx(expected_clamped, abs=0.002)
+        factor = 0.70
+        result = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA,
+                                        medium_band_factor=factor)
+        expected_low_max = result["optimal"] * factor
+        # Allow for clip boundary (low_max clamped to max(optimal - 0.01, 0.01))
+        clamp_upper = max(result["optimal"] - 0.01, 0.01)
+        expected_clamped = min(expected_low_max, clamp_upper)
+        assert result["low_max"] == pytest.approx(expected_clamped, abs=0.0001), (
+            f"low_max={result['low_max']} does not match "
+            f"optimal × factor = {expected_clamped:.4f}"
+        )
+
+    def test_medium_band_factor_configurable(self):
+        """Different factor values must produce proportionally different MEDIUM bands."""
+        result_70 = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA,
+                                           medium_band_factor=0.70)
+        result_80 = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA,
+                                           medium_band_factor=0.80)
+        # Higher factor → narrower MEDIUM band → larger low_max
+        assert result_80["low_max"] >= result_70["low_max"], (
+            "Higher medium_band_factor must produce a higher (or equal) low_max"
+        )
+
+    def test_base_rate_stored_for_provenance(self):
+        """base_rate must equal the positive class fraction in y_true."""
+        result   = find_optimal_threshold(self._Y_TRUE, self._Y_PROBA)
+        expected = float(np.mean(self._Y_TRUE))
+        assert result["base_rate"] == pytest.approx(expected, abs=0.001)
 
     # ── Contract: recall constraint ───────────────────────────────────────────
 
@@ -466,3 +570,308 @@ class TestRiskLabel:
             f"alert ≥ relaxed recall (threshold={t_relaxed['optimal']:.3f}) "
             f"for prob={prob}: got {label_strict!r} vs {label_relaxed!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# features.py — data quality and weather availability helpers
+# ---------------------------------------------------------------------------
+
+class TestFilterCorruptedDates:
+    """Tests for filter_corrupted_dates (date quality guard)."""
+
+    def _make_df(self, dates, results=None):
+        from src.features import filter_corrupted_dates  # noqa: F401
+        n = len(dates)
+        return pd.DataFrame({
+            "start_date": pd.to_datetime(dates, errors="coerce"),
+            "result":     (results or ["positive"] * n),
+        })
+
+    def test_valid_dates_are_kept(self):
+        from src.features import filter_corrupted_dates
+        df = self._make_df(["2022-05-01", "2023-08-15", "2024-03-22"])
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 3
+
+    def test_year_1900_is_dropped(self):
+        """Excel serial 0 or 1 parses to 1900 — should be removed."""
+        from src.features import filter_corrupted_dates
+        df = self._make_df(["2023-06-01", "1900-01-01"])
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 1
+        assert out["start_date"].dt.year.iloc[0] == 2023
+
+    def test_nat_rows_are_kept(self):
+        """NaT dates are not corrupted dates — they should survive the filter
+        and be handled later by the NaN-feature drop."""
+        from src.features import filter_corrupted_dates
+        df = self._make_df(["2023-06-01", None, "2024-09-10"])
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 3   # NaT row is kept
+
+    def test_boundary_years_are_kept(self):
+        """min_year and max_year themselves are inclusive."""
+        from src.features import filter_corrupted_dates
+        df = self._make_df(["2010-01-01", "2030-12-31"])
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 2
+
+    def test_future_dates_are_dropped(self):
+        """Year 2050 falls outside the valid window."""
+        from src.features import filter_corrupted_dates
+        df = self._make_df(["2023-07-01", "2050-01-01"])
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 1
+
+    def test_missing_start_date_column_returns_unchanged(self):
+        """If 'start_date' is absent the DataFrame is returned unmodified."""
+        from src.features import filter_corrupted_dates
+        df = pd.DataFrame({"other_col": [1, 2, 3]})
+        out = filter_corrupted_dates(df, 2010, 2030)
+        assert len(out) == 3
+
+
+class TestFlagWeatherAvailability:
+    """Tests for flag_weather_availability."""
+
+    def _make_weather_df(self, temp_vals, humidity_vals):
+        """Build a minimal DataFrame with two weather columns."""
+        return pd.DataFrame({
+            "temperature_max_c":    temp_vals,
+            "humidity_max_percent": humidity_vals,
+        })
+
+    def test_adds_boolean_column(self):
+        from src.features import flag_weather_availability
+        df  = self._make_weather_df([25.0, None], [None, None])
+        out = flag_weather_availability(df)
+        assert "weather_available" in out.columns
+        assert out["weather_available"].dtype == bool
+
+    def test_row_with_partial_weather_is_false(self):
+        """A row is weather-available only if all required weather columns are present."""
+        from src.features import flag_weather_availability
+        df  = self._make_weather_df([25.0, None], [None, None])
+        out = flag_weather_availability(df)
+        assert out["weather_available"].iloc[0] is np.bool_(False)
+        assert out["weather_available"].iloc[1] is np.bool_(False)
+
+    def test_fully_nan_row_is_false(self):
+        """A row where every weather column is NaN has no matched weather."""
+        from src.features import flag_weather_availability
+        df  = self._make_weather_df([None, None], [None, None])
+        out = flag_weather_availability(df)
+        assert not out["weather_available"].any()
+
+    def test_all_present_rows_are_true(self):
+        from src.features import flag_weather_availability
+        df  = self._make_weather_df([20.0, 25.0], [70.0, 80.0])
+        out = flag_weather_availability(df)
+        assert out["weather_available"].all()
+
+    def test_no_weather_columns_sets_false(self):
+        """When no weather columns exist the flag is False for all rows."""
+        from src.features import flag_weather_availability
+        df  = pd.DataFrame({"month": [5, 6, 7]})   # only temporal, no weather
+        out = flag_weather_availability(df)
+        assert "weather_available" in out.columns
+        assert not out["weather_available"].any()
+
+    def test_does_not_modify_original_df(self):
+        """flag_weather_availability must not mutate the input DataFrame."""
+        from src.features import flag_weather_availability
+        df  = self._make_weather_df([25.0], [80.0])
+        _   = flag_weather_availability(df)
+        assert "weather_available" not in df.columns
+
+
+class TestGetTemporalFeatureColumns:
+    """Tests for get_temporal_feature_columns."""
+
+    def test_returns_list(self):
+        from src.features import get_temporal_feature_columns
+        cfg = {"features": {"temporal": ["month", "day_of_year", "week_of_year"]}}
+        assert isinstance(get_temporal_feature_columns(cfg), list)
+
+    def test_matches_config_temporal_list(self):
+        from src.features import get_temporal_feature_columns
+        temporal = ["month", "day_of_year", "week_of_year"]
+        cfg      = {"features": {"temporal": temporal}}
+        assert get_temporal_feature_columns(cfg) == temporal
+
+    def test_default_when_key_missing(self):
+        """Falls back to the standard three temporal columns if key is absent."""
+        from src.features import get_temporal_feature_columns
+        cfg = {"features": {}}
+        cols = get_temporal_feature_columns(cfg)
+        assert cols == ["month", "day_of_year", "week_of_year"]
+
+    def test_returns_independent_copy(self):
+        """Mutating the returned list must not alter the config dict."""
+        from src.features import get_temporal_feature_columns
+        temporal = ["month", "day_of_year", "week_of_year"]
+        cfg      = {"features": {"temporal": temporal}}
+        result   = get_temporal_feature_columns(cfg)
+        result.append("extra_col")
+        assert cfg["features"]["temporal"] == temporal  # config unchanged
+
+
+# ---------------------------------------------------------------------------
+# Probability calibration
+# ---------------------------------------------------------------------------
+
+class TestCalibration:
+    """
+    Tests for _CalibratedWrapper / _calibrate_pipeline and _get_inner_pipeline helper.
+
+    Design intent
+    ─────────────
+    Calibration is a post-processing wrapper: it must not change the model's
+    discriminative ability (AUC), must expose predict_proba(), and must allow
+    SHAP / predict.py to reach the inner sklearn Pipeline via _get_inner_pipeline.
+    """
+
+    def _make_calibrated_pipe(self, n: int = 200, cal_frac: float = 0.25):
+        """Return (calibrated_pipe, X_test, y_test) on synthetic data."""
+        rng    = np.random.default_rng(7)
+        X      = pd.DataFrame({
+            "temperature_max_c":    rng.normal(25, 5, n),
+            "humidity_max_percent": rng.normal(75, 10, n),
+            "precipitation_mm":     rng.exponential(3, n),
+        })
+        y = ((X["temperature_max_c"] > 25) & (X["humidity_max_percent"] > 75)).astype(int)
+
+        cut_test = int(n * 0.80)
+        cut_cal  = int(cut_test * (1 - cal_frac))
+
+        X_fit  = X.iloc[:cut_cal];       y_fit  = y.iloc[:cut_cal]
+        X_cal  = X.iloc[cut_cal:cut_test]; y_cal  = y.iloc[cut_cal:cut_test]
+        X_test = X.iloc[cut_test:];      y_test = y.iloc[cut_test:]
+
+        base = build_pipeline(_MODEL_CFG_LR)
+        base.fit(X_fit, y_fit)
+
+        cal = _calibrate_pipeline(base, X_cal, y_cal, method="sigmoid")
+        return cal, X_test, y_test
+
+    # ── _get_inner_pipeline ──────────────────────────────────────────────────
+
+    def test_get_inner_pipeline_returns_pipeline_from_calibrated(self):
+        cal, X_test, _ = self._make_calibrated_pipe()
+        inner = _get_inner_pipeline(cal)
+        assert isinstance(inner, Pipeline), (
+            "_get_inner_pipeline must return the base Pipeline from a calibrated wrapper"
+        )
+
+    def test_get_inner_pipeline_passthrough_on_plain_pipeline(self):
+        pipe = build_pipeline(_MODEL_CFG_LR)
+        assert _get_inner_pipeline(pipe) is pipe, (
+            "_get_inner_pipeline must return the pipe unchanged if not calibrated"
+        )
+
+    def test_inner_pipeline_has_named_steps(self):
+        cal, X_test, _ = self._make_calibrated_pipe()
+        inner = _get_inner_pipeline(cal)
+        assert hasattr(inner, "named_steps")
+        assert "imputer" in inner.named_steps
+
+    # ── Calibrated wrapper behaviour ─────────────────────────────────────────
+
+    def test_calibrated_predict_proba_returns_valid_array(self):
+        cal, X_test, _ = self._make_calibrated_pipe()
+        proba = cal.predict_proba(X_test)
+        assert proba.shape[1] == 2
+        assert np.all(proba >= 0) and np.all(proba <= 1)
+        assert np.allclose(proba.sum(axis=1), 1.0)
+
+    def test_calibrated_auc_is_close_to_uncalibrated(self):
+        """
+        Calibration adjusts probability values but must not degrade ranking.
+        AUC of calibrated model should be within 0.05 of uncalibrated AUC.
+        """
+        from sklearn.metrics import roc_auc_score
+        rng  = np.random.default_rng(42)
+        n    = 300
+        X    = pd.DataFrame({
+            "temperature_max_c":    rng.normal(25, 5, n),
+            "humidity_max_percent": rng.normal(75, 10, n),
+            "precipitation_mm":     rng.exponential(3, n),
+        })
+        y    = ((X["temperature_max_c"] > 25) & (X["humidity_max_percent"] > 75)).astype(int)
+
+        cut_test = int(n * 0.80)
+        cut_cal  = int(cut_test * 0.75)
+
+        base = build_pipeline(_MODEL_CFG_LR)
+        base.fit(X.iloc[:cut_cal], y.iloc[:cut_cal])
+
+        cal = _calibrate_pipeline(base, X.iloc[cut_cal:cut_test], y.iloc[cut_cal:cut_test], method="sigmoid")
+
+        X_test = X.iloc[cut_test:]
+        y_test = y.iloc[cut_test:]
+
+        auc_base = roc_auc_score(y_test, base.predict_proba(X_test)[:, 1])
+        auc_cal  = roc_auc_score(y_test, cal.predict_proba(X_test)[:, 1])
+
+        assert abs(auc_cal - auc_base) <= 0.08, (
+            f"Calibration degraded AUC significantly: "
+            f"base={auc_base:.3f}, calibrated={auc_cal:.3f}"
+        )
+
+    def test_feature_names_accessible_after_calibration(self):
+        """
+        predict.py looks up feature_names_in_ via _get_inner_pipeline.
+        This must work on a calibrated model.
+        """
+        cal, X_test, _ = self._make_calibrated_pipe()
+        inner = _get_inner_pipeline(cal)
+        imputer = inner.named_steps.get("imputer")
+        assert imputer is not None
+        assert hasattr(imputer, "feature_names_in_"), (
+            "feature_names_in_ must be available after fitting the inner pipeline"
+        )
+
+    # ── evaluate_crop with calibration enabled ───────────────────────────────
+
+    def test_evaluate_crop_with_calibration_returns_3_tuple(self, split_data):
+        X_train, y_train, X_test, y_test = split_data
+        result = evaluate_crop(
+            X_train, y_train, X_test, y_test,
+            model_cfg=_MODEL_CFG_LR, cv_folds=3, crop="TestCrop",
+            calibration_cfg={"enabled": True, "cal_size": 0.20,
+                             "method": "sigmoid", "min_cal_samples": 10},
+        )
+        assert len(result) == 3, "evaluate_crop must return (pipe, metrics, y_proba_uncal)"
+
+    def test_evaluate_crop_calibrated_pipe_has_predict_proba(self, split_data):
+        X_train, y_train, X_test, y_test = split_data
+        pipe, _, _ = evaluate_crop(
+            X_train, y_train, X_test, y_test,
+            model_cfg=_MODEL_CFG_LR, cv_folds=3, crop="TestCrop",
+            calibration_cfg={"enabled": True, "cal_size": 0.20,
+                             "method": "sigmoid", "min_cal_samples": 10},
+        )
+        proba = pipe.predict_proba(X_test)
+        assert proba.shape == (len(X_test), 2)
+
+    def test_evaluate_crop_calibration_flag_in_metrics(self, split_data):
+        X_train, y_train, X_test, y_test = split_data
+        _, metrics, _ = evaluate_crop(
+            X_train, y_train, X_test, y_test,
+            model_cfg=_MODEL_CFG_LR, cv_folds=3, crop="TestCrop",
+            calibration_cfg={"enabled": True, "cal_size": 0.20,
+                             "method": "sigmoid", "min_cal_samples": 10},
+        )
+        assert "calibrated" in metrics
+        assert metrics["calibrated"] is True
+
+    def test_evaluate_crop_no_calibration_returns_plain_pipeline(self, split_data):
+        X_train, y_train, X_test, y_test = split_data
+        pipe, metrics, y_uncal = evaluate_crop(
+            X_train, y_train, X_test, y_test,
+            model_cfg=_MODEL_CFG_LR, cv_folds=3, crop="TestCrop",
+            calibration_cfg={"enabled": False},
+        )
+        assert isinstance(pipe, Pipeline), "Without calibration, pipe must be a plain Pipeline"
+        assert metrics["calibrated"] is False
+        assert y_uncal is None

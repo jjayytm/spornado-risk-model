@@ -1,0 +1,14 @@
+{
+  "Corn": {
+    "model_suffix": "_model_baseline.pkl",
+    "threshold_stem": "_thresholds"
+  },
+  "Soybean": {
+    "model_suffix": "_model_weather.pkl",
+    "threshold_stem": "_weather_thresholds"
+  },
+  "Wheat": {
+    "model_suffix": "_model_weather.pkl",
+    "threshold_stem": "_weather_thresholds"
+  }
+}

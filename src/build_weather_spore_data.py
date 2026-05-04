@@ -1,26 +1,46 @@
 #!/usr/bin/env python3
 """
-End-to-end pipeline: merge raw trap data with per-location weather files.
+Build the model-ready dataset: enrich GPS trap data with per-location weather.
+
+Why only More Data.csv?
+-----------------------
+The disease triangle requires all three components at prediction time:
+  1. Weather  (open-source, location-specific)
+  2. Hybrid   (variety susceptibility)
+  3. Spornado (spore count from trap)
+
+All data.xlsx has no GPS coordinates, so weather cannot be matched to those
+rows.  Training on structurally incomplete triangle data would teach the model
+a corrupted pattern — more rows is not better when a third of the triangle is
+systematically missing.
+
+More Data.csv has GPS for every row, enabling full weather enrichment and
+complete triangle representation.  This is the only source used for model
+training.
+
+All data.xlsx is preserved separately for spore count percentile analysis
+(Spornado score normalisation), which does not require GPS or weather.
 
 Steps
 -----
-1. Read All data.xlsx   (no GPS, Excel serial dates)
-2. Read More Data.csv   (includes GPS lat / lon)
-3. Combine into a single dataset with canonical column names
-4. For each row that has GPS: find the nearest weather file within
-   MAX_MATCH_KM kilometres using the haversine formula
-5. Merge daily weather columns into the combined dataset
-6. Save → data/raw/spornado_weather_spore_data.csv
+1. Load More Data.csv  (GPS trap data — primary model training source)
+2. Validate coordinates and dates
+3. Load per-location weather files from weather_dir
+4. Match each row to its nearest weather station (within max_km)
+5. Merge weather columns into the dataset
+6. Save enriched CSV → paths.data_merged
+
+Configuration
+-------------
+All tunable values (paths, match radius, weather columns) are read from
+config/config.yaml via src.config_loader.  CLI flags override config values
+for one-off runs without editing the config file.
 
 Usage
 -----
-  python build_weather_spore_data.py
-  python build_weather_spore_data.py --help
-  python build_weather_spore_data.py \\
-      --xlsx   data/raw/All\\ data.xlsx \\
-      --csv    data/raw/More\\ Data.csv \\
-      --weather data/weather \\
-      --output  data/raw/spornado_weather_spore_data.csv
+  python -m src.build_weather_spore_data
+  python -m src.build_weather_spore_data --help
+  python -m src.build_weather_spore_data --csv "data/raw/More Data.csv"
 """
 
 from __future__ import annotations
@@ -30,39 +50,29 @@ import csv
 import logging
 import math
 import sys
-import zipfile
-import xml.etree.ElementTree as ET
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_ROOT))
+
+from src.config_loader import load as load_config
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Constants
+# Fixed schema — dictated by More Data.csv column names.
+# Change only if the upstream file format changes.
 # ---------------------------------------------------------------------------
 
-_ROOT = Path(__file__).resolve().parent.parent  # project root (one level up from src/)
+# Columns expected in More Data.csv (after strip)
+_CSV_DATE_COLS = ("Start Date", "End Date", "Created At", "Updated At")
 
-# Default paths (all relative to project root; overridable via CLI)
-_DEFAULT_XLSX    = _ROOT / "data" / "raw" / "All data.xlsx"
-_DEFAULT_CSV     = _ROOT / "data" / "raw" / "More Data.csv"
-_DEFAULT_WEATHER = _ROOT / "data" / "weather"
-_DEFAULT_OUTPUT  = _ROOT / "data" / "raw" / "spornado_weather_spore_data.csv"
-
-MAX_MATCH_KM = 15.0   # nearest-weather search radius in kilometres
-
-FINAL_COLUMNS = [
-    "Customer name", "Laboratory name", "Spornado serial", "Ref. number",
-    "Crop type", "Result CQ", "Spore count", "Cassette", "Test", "Result",
-    "Start Date", "End Date", "Location Ref", "GPS latitude", "GPS longitude",
-    "Created by", "Created At", "Updated By", "Updated At", "_source",
-]
-
-WEATHER_COLS = [
-    "temperature_min_c", "temperature_max_c", "temperature_mean_c",
-    "humidity_max_percent", "precipitation_mm", "wind_speed_max_kmh",
-    "dew_point_min_c",
-]
+# Weather column names as they appear inside weather_<lat>_<lon>.csv files.
+# These must match config.yaml features.weather exactly — validated at startup.
+_WEATHER_FILE_COL_ALIASES: dict[str, str] = {
+    # weather file col → canonical name  (identity if same)
+}
 
 
 # ---------------------------------------------------------------------------
@@ -71,10 +81,11 @@ WEATHER_COLS = [
 
 def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """Great-circle distance in kilometres between two WGS-84 points."""
-    R = 6_371.0
-    phi1, phi2   = math.radians(lat1), math.radians(lat2)
-    dphi         = math.radians(lat2 - lat1)
-    dlambda      = math.radians(lon2 - lon1)
+    R    = 6_371.0
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    dphi    = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
     a = (math.sin(dphi / 2) ** 2
          + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2)
     return R * 2.0 * math.asin(math.sqrt(a))
@@ -86,7 +97,7 @@ def find_nearest(
     loc_coords: list[tuple[float, float]],
     max_km: float,
 ) -> tuple[float, float] | None:
-    """Return the (lat, lon) key of the nearest weather location within max_km."""
+    """Return (lat, lon) of the nearest weather station within max_km, or None."""
     best_key  = None
     best_dist = max_km
     for clat, clon in loc_coords:
@@ -101,24 +112,12 @@ def find_nearest(
 # Cleaning helpers
 # ---------------------------------------------------------------------------
 
-def excel_serial_to_date(serial: str) -> str:
-    """Convert an Excel 1900-based date serial to an ISO-8601 string."""
-    try:
-        n = int(float(serial))
-        if n > 59:          # Excel incorrectly treats 1900 as a leap year
-            n -= 1
-        return (date(1899, 12, 31) + timedelta(days=n)).isoformat()
-    except Exception:
-        return serial       # return as-is if not parseable
-
-
 def clean_coord(val: str | None) -> float | None:
-    """Strip leading apostrophe / quote artefacts and return float or None."""
+    """Strip apostrophe/quote artefacts and parse to float, or return None."""
     if val is None:
         return None
-    cleaned = str(val).strip().strip("'").strip('"').strip()
     try:
-        return float(cleaned)
+        return float(str(val).strip().strip("'\""))
     except ValueError:
         return None
 
@@ -128,231 +127,304 @@ def clean_spore_count(val: str) -> str:
     return val.replace(",", "") if val else val
 
 
-def clean_gps(val: str) -> str:
-    """Strip leading apostrophe artefact: ''-81.68 → -81.68."""
-    return val.strip().lstrip("'") if val else val
+def normalize_date(value: str | None) -> str:
+    """
+    Normalize common date formats to ISO YYYY-MM-DD.
 
+    Supports:
+    - YYYY-MM-DD
+    - M/D/YYYY, MM/DD/YYYY
+    - M/D/YY, MM/DD/YY
+    Returns empty string if parsing fails.
+    """
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
 
-# ---------------------------------------------------------------------------
-# Step 1 — parse All data.xlsx
-# ---------------------------------------------------------------------------
+    # Common CSV export with time component: keep date token only.
+    token = raw.split()[0]
 
-def read_xlsx(path: Path) -> list[dict]:
-    """Return a list of row-dicts with canonical FINAL_COLUMNS names."""
-    logger.info("[1/5] Reading %s …", path.name)
-
-    with zipfile.ZipFile(path) as z:
-        ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y"):
         try:
-            ss_root = ET.fromstring(z.read("xl/sharedStrings.xml"))
-            shared_strings = [
-                "".join(t.text or "" for t in si.findall(".//x:t", ns))
-                for si in ss_root.findall(".//x:si", ns)
-            ]
-        except KeyError:
-            shared_strings = []
+            if fmt == "%Y-%m-%d":
+                return date.fromisoformat(token).isoformat()
+            return datetime.strptime(token, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return ""
 
-        sheet_root = ET.fromstring(z.read("xl/worksheets/sheet1.xml"))
 
-    def col_letter_to_index(ref: str) -> int:
-        letters = "".join(ch for ch in ref if ch.isalpha())
-        idx = 0
-        for ch in letters.upper():
-            idx = idx * 26 + (ord(ch) - ord("A") + 1)
-        return idx - 1
-
-    def cell_val(cell: ET.Element) -> str:
-        v = cell.find("x:v", ns)
-        if v is None or v.text is None:
-            return ""
-        if cell.get("t") == "s":
-            i = int(v.text)
-            return shared_strings[i] if i < len(shared_strings) else ""
-        return v.text
-
-    rows_el = sheet_root.findall(".//x:row", ns)
-    if not rows_el:
-        logger.warning("No rows found in %s", path.name)
-        return []
-
-    header_by_col: dict[int, str] = {}
-    for c in rows_el[0].findall("x:c", ns):
-        ref = c.get("r", "")
-        if ref:
-            header_by_col[col_letter_to_index(ref)] = cell_val(c)
-
-    records: list[dict] = []
-    for row_el in rows_el[1:]:
-        raw: dict[str, str] = {}
-        for c in row_el.findall("x:c", ns):
-            ref = c.get("r", "")
-            if ref:
-                col_idx  = col_letter_to_index(ref)
-                col_name = header_by_col.get(col_idx, "")
-                if col_name:
-                    raw[col_name] = cell_val(c)
-
-        records.append({
-            "Customer name":   raw.get("Customer name", ""),
-            "Laboratory name": raw.get("User name", ""),
-            "Spornado serial": raw.get("Spornado serial", ""),
-            "Ref. number":     raw.get("ref_number", ""),
-            "Crop type":       raw.get("Crop type", ""),
-            "Result CQ":       raw.get("Result CQ", ""),
-            "Spore count":     raw.get("Spore count", ""),
-            "Cassette":        raw.get("Sample/Cassette", ""),
-            "Test":            raw.get("Test", ""),
-            "Result":          raw.get("Result", ""),
-            "Start Date":      excel_serial_to_date(raw.get("Start Date", "")),
-            "End Date":        excel_serial_to_date(raw.get("End Date", "")),
-            "Location Ref":    raw.get("gps", ""),
-            "GPS latitude":    "",
-            "GPS longitude":   "",
-            "Created by":      raw.get("Created By", ""),
-            "Created At":      excel_serial_to_date(raw.get("Created At", "")),
-            "Updated By":      raw.get("Updated By", ""),
-            "Updated At":      excel_serial_to_date(raw.get("Updated At", "")),
-            "_source":         "All_data_xlsx",
-        })
-
-    logger.info("    → %d rows from xlsx", len(records))
-    return records
+def is_valid_coord(lat: float | None, lon: float | None) -> bool:
+    """Basic sanity check — WGS-84 bounds."""
+    if lat is None or lon is None:
+        return False
+    return -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0
 
 
 # ---------------------------------------------------------------------------
-# Step 2 — read More Data.csv
+# Step 1 — load More Data.csv
 # ---------------------------------------------------------------------------
 
-def read_more_data(path: Path) -> list[dict]:
-    logger.info("[2/5] Reading %s …", path.name)
+def load_csv(path: Path) -> list[dict]:
+    """
+    Load the GPS trap data CSV.
+
+    Normalises column names (strip whitespace), cleans GPS artefacts,
+    and logs a per-column missing-value summary for data quality awareness.
+    """
+    logger.info("[1/4] Loading %s …", path.name)
+
     records: list[dict] = []
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             rec = {k.strip(): v.strip() for k, v in row.items()}
-            rec["_source"] = "More_Data_csv"
+            # Clean known artefacts
+            rec["GPS latitude"]  = rec.get("GPS latitude",  "").lstrip("'")
+            rec["GPS longitude"] = rec.get("GPS longitude", "").lstrip("'")
+            rec["Spore count"]   = clean_spore_count(rec.get("Spore count", ""))
+            rec["Start Date"]    = normalize_date(rec.get("Start Date", ""))
             records.append(rec)
-    logger.info("    → %d rows from csv", len(records))
+
+    if not records:
+        raise ValueError(f"No records found in {path}. Check the file path and format.")
+
+    # ── Data quality summary ─────────────────────────────────────────────────
+    total = len(records)
+    cols  = list(records[0].keys())
+    logger.info("  Loaded %d rows × %d columns", total, len(cols))
+
+    missing_summary = {
+        col: sum(1 for r in records if not r.get(col, "").strip())
+        for col in cols
+    }
+    problem_cols = {c: n for c, n in missing_summary.items() if n > 0}
+    if problem_cols:
+        logger.info("  Missing value counts:")
+        for col, n in sorted(problem_cols.items(), key=lambda x: -x[1]):
+            logger.info("    %-35s %d / %d  (%.1f%%)", col, n, total, 100 * n / total)
+
+    # ── GPS coverage ─────────────────────────────────────────────────────────
+    has_gps = sum(
+        1 for r in records
+        if is_valid_coord(clean_coord(r.get("GPS latitude")),
+                          clean_coord(r.get("GPS longitude")))
+    )
+    logger.info(
+        "  GPS-valid rows : %d / %d  (%.1f%%)",
+        has_gps, total, 100 * has_gps / total,
+    )
+    if has_gps < total:
+        logger.warning(
+            "  %d rows have invalid/missing GPS — these will have no weather "
+            "enrichment and will be excluded from model training.",
+            total - has_gps,
+        )
+
     return records
 
 
 # ---------------------------------------------------------------------------
-# Step 3 — combine
-# ---------------------------------------------------------------------------
-
-def combine(xlsx_rows: list[dict], csv_rows: list[dict]) -> list[dict]:
-    logger.info("[3/5] Combining datasets …")
-    all_rows: list[dict] = []
-    for r in xlsx_rows + csv_rows:
-        rec = {col: r.get(col, "") for col in FINAL_COLUMNS}
-        rec["Spore count"]   = clean_spore_count(rec["Spore count"])
-        rec["GPS latitude"]  = clean_gps(rec["GPS latitude"])
-        rec["GPS longitude"] = clean_gps(rec["GPS longitude"])
-        all_rows.append(rec)
-    logger.info("    → %d total rows", len(all_rows))
-    return all_rows
-
-
-# ---------------------------------------------------------------------------
-# Step 4 — load weather files
+# Step 2 — load weather files
 # ---------------------------------------------------------------------------
 
 def load_weather(
     weather_dir: Path,
+    weather_cols: list[str],
 ) -> tuple[dict[tuple[float, float], dict[str, dict]], list[tuple[float, float]]]:
-    logger.info("[4/5] Loading weather files from %s/ …", weather_dir.name)
+    """
+    Load all per-location weather CSVs from weather_dir.
+
+    Validates that expected weather columns are present in at least one file
+    so mismatches with config.yaml are caught before the merge step.
+
+    Expected filename format: weather_<lat>_<lon>.csv
+
+    Returns
+    -------
+    weather_by_loc : (lat, lon) → {date_str → row_dict}
+    loc_coords     : list of (lat, lon) keys for nearest-neighbour search
+    """
+    logger.info("[2/4] Loading weather files from %s/ …", weather_dir.name)
+
     weather_files = sorted(weather_dir.glob("weather_*.csv"))
-    logger.info("    Found %d files", len(weather_files))
+    if not weather_files:
+        raise FileNotFoundError(
+            f"No weather_*.csv files found in {weather_dir}.\n"
+            "Fetch weather data first or point --weather at the correct directory."
+        )
+    logger.info("  Found %d weather files", len(weather_files))
 
     weather_by_loc: dict[tuple[float, float], dict[str, dict]] = {}
-    loc_coords: list[tuple[float, float]] = []
+    loc_coords:     list[tuple[float, float]]                   = []
+    cols_validated = False
 
     for wf in weather_files:
         loc_data: dict[str, dict] = {}
         with open(wf, newline="", encoding="utf-8") as f:
-            for row in csv.DictReader(f):
-                d = row.get("date", "").strip()[:10]   # YYYY-MM-DD
+            reader = csv.DictReader(f)
+            for row in reader:
+                d = row.get("date", "").strip()[:10]
                 if d:
                     loc_data[d] = row
 
+            # Validate that expected weather columns exist (once)
+            if not cols_validated and reader.fieldnames:
+                missing_cols = [c for c in weather_cols if c not in reader.fieldnames]
+                if missing_cols:
+                    logger.warning(
+                        "  Weather file '%s' is missing columns: %s\n"
+                        "  Check that config.yaml features.weather matches "
+                        "the weather file schema.",
+                        wf.name, missing_cols,
+                    )
+                cols_validated = True
+
         if not loc_data:
+            logger.debug("  Skipping empty weather file: %s", wf.name)
             continue
 
-        # Filename format: weather_<lat>_<lon>.csv
-        stem  = wf.stem          # e.g. weather_36.4298_-89.9866
-        parts = stem.split("_", 1)[1]   # 36.4298_-89.9866
+        # Parse lat/lon from filename: weather_<lat>_<lon>.csv
+        stem  = wf.stem
+        parts = stem.split("_", 1)[1]
         idx   = parts.rfind("_")
         try:
-            lat = round(float(parts[:idx]), 4)
+            lat = round(float(parts[:idx]),     4)
             lon = round(float(parts[idx + 1:]), 4)
         except ValueError:
-            logger.warning("Cannot parse lat/lon from filename: %s — skipping.", wf.name)
+            logger.warning("Cannot parse lat/lon from '%s' — skipping.", wf.name)
             continue
 
         key = (lat, lon)
         weather_by_loc[key] = loc_data
         loc_coords.append(key)
 
-    logger.info("    → %d unique weather locations loaded", len(loc_coords))
+    logger.info("  Loaded %d unique weather locations", len(loc_coords))
     return weather_by_loc, loc_coords
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — merge and save
+# Step 3 — enrich with weather
 # ---------------------------------------------------------------------------
 
-def merge_and_save(
-    combined: list[dict],
+def enrich_with_weather(
+    records:        list[dict],
     weather_by_loc: dict[tuple[float, float], dict[str, dict]],
-    loc_coords: list[tuple[float, float]],
-    output_path: Path,
-    max_km: float,
-) -> None:
-    logger.info("[5/5] Merging weather data and saving …")
+    loc_coords:     list[tuple[float, float]],
+    weather_cols:   list[str],
+    max_km:         float,
+) -> list[dict]:
+    """
+    Join weather data onto each trap record using GPS + trap date.
 
-    matched  = 0
-    no_gps   = 0
-    no_match = 0
+    Match logic
+    -----------
+    1. Parse lat/lon from the record.
+    2. Find the nearest weather station within max_km.
+    3. Look up the row's Start Date in that station's daily records.
+    4. Copy weather_cols into the record.  Missing = empty string.
 
-    out_cols = FINAL_COLUMNS + WEATHER_COLS
-    out_rows: list[dict] = []
+    Rows that fail step 1 or 2 are kept in the output with empty weather
+    columns so the full dataset is preserved; downstream feature engineering
+    (build_crop_models.py) uses the weather_available flag to route them.
 
-    for rec in combined:
+    Returns the enriched records list (new dicts — originals unchanged).
+    """
+    logger.info("[3/4] Enriching %d records with weather …", len(records))
+
+    matched    = 0
+    no_gps     = 0
+    no_station = 0
+    no_date    = 0
+
+    enriched: list[dict] = []
+
+    for rec in records:
+        out = dict(rec)   # copy — do not mutate original
+
         lat      = clean_coord(rec.get("GPS latitude"))
         lon      = clean_coord(rec.get("GPS longitude"))
-        date_str = rec.get("Start Date", "")[:10]
+        date_str = normalize_date(rec.get("Start Date", ""))
 
-        wx = {col: "" for col in WEATHER_COLS}
+        wx = {col: "" for col in weather_cols}
 
-        if lat is None or lon is None:
+        if not is_valid_coord(lat, lon):
             no_gps += 1
+        elif not date_str:
+            no_date += 1
         else:
             nearest = find_nearest(lat, lon, loc_coords, max_km)
-            if nearest and date_str:
+            if nearest is None:
+                no_station += 1
+            else:
                 day_wx = weather_by_loc.get(nearest, {}).get(date_str)
                 if day_wx:
-                    wx = {col: day_wx.get(col, "") for col in WEATHER_COLS}
+                    wx = {col: day_wx.get(col, "") for col in weather_cols}
                     matched += 1
                 else:
-                    no_match += 1
-            else:
-                no_match += 1
+                    no_station += 1
 
-        out_row = {col: rec.get(col, "") for col in FINAL_COLUMNS}
-        out_row.update(wx)
-        out_rows.append(out_row)
+        out.update(wx)
+        enriched.append(out)
+
+    total = len(enriched)
+    logger.info(
+        "  Weather matched        : %d / %d  (%.1f%%)",
+        matched, total, 100 * matched / total if total else 0,
+    )
+    logger.info(
+        "  No valid GPS           : %d / %d  (%.1f%%)",
+        no_gps, total, 100 * no_gps / total if total else 0,
+    )
+    logger.info(
+        "  No nearby station      : %d / %d  (%.1f%%)",
+        no_station, total, 100 * no_station / total if total else 0,
+    )
+    if no_date:
+        logger.warning(
+            "  Missing Start Date     : %d rows — cannot look up daily weather.",
+            no_date,
+        )
+
+    usable = matched
+    logger.info(
+        "  Rows usable for training (full triangle): %d / %d  (%.1f%%)",
+        usable, total, 100 * usable / total if total else 0,
+    )
+
+    return enriched
+
+
+# ---------------------------------------------------------------------------
+# Step 4 — save
+# ---------------------------------------------------------------------------
+
+def save(
+    records:      list[dict],
+    weather_cols: list[str],
+    output_path:  Path,
+) -> None:
+    """Write enriched records to CSV, preserving original columns + weather."""
+    if not records:
+        raise ValueError("No records to save.")
+
+    all_cols = list(records[0].keys())
+    # Ensure weather cols are present in the header even if all empty
+    for col in weather_cols:
+        if col not in all_cols:
+            all_cols.append(col)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=out_cols)
+        writer = csv.DictWriter(f, fieldnames=all_cols, extrasaction="ignore")
         writer.writeheader()
-        writer.writerows(out_rows)
+        writer.writerows(records)
 
-    total = len(out_rows)
-    logger.info("  Weather matched     : %d / %d  (%.1f%%)", matched,  total, 100 * matched  / total if total else 0)
-    logger.info("  No GPS              : %d / %d  (%.1f%%)", no_gps,   total, 100 * no_gps   / total if total else 0)
-    logger.info("  GPS but no match    : %d / %d  (%.1f%%)", no_match, total, 100 * no_match / total if total else 0)
-    logger.info("  Saved → %s", output_path)
-    logger.info("  Rows: %d  |  Columns: %d", len(out_rows), len(out_cols))
+    logger.info(
+        "[4/4] Saved -> %s  (%d rows x %d columns)",
+        output_path, len(records), len(all_cols),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -360,55 +432,66 @@ def merge_and_save(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    # ── Load config first so defaults come from one place ─────────────────────
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre_args, _ = pre.parse_known_args()
+    cfg = load_config(Path(pre_args.config) if pre_args.config else None)
+
+    default_csv     = cfg["paths"]["data_raw_csv"]
+    default_weather = cfg["paths"]["weather_dir"]
+    default_output  = cfg["paths"]["data_merged"]
+    default_max_km  = cfg["data"].get("weather_match_max_km", 15.0)
+    weather_cols    = cfg["features"]["weather"]
+
     parser = argparse.ArgumentParser(
-        description="Merge Spornado trap data with per-location weather files.",
+        description=(
+            "Enrich Spornado GPS trap data with per-location weather.\n"
+            "Primary input: More Data.csv (GPS rows only — full triangle possible)."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--xlsx",    default=str(_DEFAULT_XLSX),    help="Path to All data.xlsx")
-    parser.add_argument("--csv",     default=str(_DEFAULT_CSV),     help="Path to More Data.csv")
-    parser.add_argument("--weather", default=str(_DEFAULT_WEATHER), help="Directory of weather_<lat>_<lon>.csv files")
-    parser.add_argument("--output",  default=str(_DEFAULT_OUTPUT),  help="Output CSV path")
-    parser.add_argument("--max-km",  default=MAX_MATCH_KM, type=float,
-                        help="Maximum distance (km) to match a GPS point to a weather file")
+    parser.add_argument("--csv",     default=default_csv,     help="Path to More Data.csv")
+    parser.add_argument("--weather", default=default_weather, help="Directory of weather_<lat>_<lon>.csv files")
+    parser.add_argument("--output",  default=default_output,  help="Output enriched CSV path")
+    parser.add_argument("--max-km",  default=default_max_km,  type=float,
+                        help="Maximum GPS-to-station distance in km")
+    parser.add_argument("--config",  default=None,            help="Path to config.yaml")
     args = parser.parse_args()
 
     logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s  %(levelname)-8s  %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        level   = logging.INFO,
+        format  = "%(asctime)s  %(levelname)-8s  %(message)s",
+        handlers= [logging.StreamHandler(sys.stdout)],
     )
 
-    xlsx_path    = Path(args.xlsx)
-    csv_path     = Path(args.csv)
-    weather_dir  = Path(args.weather)
-    output_path  = Path(args.output)
+    csv_path    = Path(args.csv)
+    weather_dir = Path(args.weather)
+    output_path = Path(args.output)
 
-    for p, label in [(xlsx_path, "--xlsx"), (csv_path, "--csv")]:
-        if not p.exists():
-            logger.error("File not found (%s): %s", label, p)
-            sys.exit(1)
-
+    if not csv_path.exists():
+        logger.error("CSV not found: %s", csv_path)
+        sys.exit(1)
     if not weather_dir.exists():
-        logger.error("Weather directory not found (--weather): %s", weather_dir)
+        logger.error("Weather directory not found: %s", weather_dir)
         sys.exit(1)
 
     logger.info("=" * 60)
-    logger.info("Spornado — End-to-End Data Build")
+    logger.info("Spornado — Weather Enrichment Pipeline")
     logger.info("=" * 60)
+    logger.info("  Input            : %s", csv_path)
+    logger.info("  Weather dir      : %s", weather_dir)
+    logger.info("  Output           : %s", output_path)
+    logger.info("  Max match radius : %.1f km", args.max_km)
+    logger.info("  Weather columns  : %s", weather_cols)
 
-    xlsx_rows = read_xlsx(xlsx_path)
-    csv_rows  = read_more_data(csv_path)
-    combined  = combine(xlsx_rows, csv_rows)
-
-    weather_by_loc, loc_coords = load_weather(weather_dir)
-
-    if not loc_coords:
-        logger.warning(
-            "No weather files loaded. Output will have empty weather columns. "
-            "Check that --weather points to a directory of weather_<lat>_<lon>.csv files."
-        )
-
-    merge_and_save(combined, weather_by_loc, loc_coords, output_path, args.max_km)
+    records                 = load_csv(csv_path)
+    weather_by_loc, coords  = load_weather(weather_dir, weather_cols)
+    enriched                = enrich_with_weather(
+                                  records, weather_by_loc, coords,
+                                  weather_cols, args.max_km,
+                              )
+    save(enriched, weather_cols, output_path)
     logger.info("Done.")
 
 

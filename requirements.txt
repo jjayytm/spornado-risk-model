@@ -4,6 +4,8 @@ numpy>=1.26
 scikit-learn>=1.5      # includes joblib as a dependency
 scipy>=1.13
 joblib>=1.4            # model serialisation (explicit pin; ships with scikit-learn)
+xgboost>=2.0           # gradient-boosted trees (recommended default model)
+shap>=0.46             # model explainability — SHAP feature importance plots
 
 # ── Visualisation ────────────────────────────────────────────────────────────
 matplotlib>=3.9

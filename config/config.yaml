@@ -3,25 +3,38 @@
 # Paths are relative to the project root (directory containing this config/ folder).
 
 paths:
-  data_merged:   data/raw/spornado_weather_spore_data.csv  # output of build_weather_spore_data.py
-  data_raw_xlsx: data/raw/All data.xlsx
+  # Primary model training source — GPS rows only (full disease triangle possible)
   data_raw_csv:  data/raw/More Data.csv
-  weather_dir:   data/weather          # directory of per-location weather_<lat>_<lon>.csv files
-  tolerance_dir: data/processed        # corn/soybean/potato disease tolerance CSVs
+
+  # Historical archive — no GPS, used only for spore count distribution analysis
+  # NOT used for model training (weather cannot be matched without coordinates)
+  data_raw_xlsx: data/raw/All data.xlsx
+
+  # Output of build_weather_spore_data.py — enriched CSV ready for feature engineering
+  data_merged:   data/raw/spornado_weather_spore_data.csv
+
+  weather_dir:   data/weather          # per-location weather_<lat>_<lon>.csv files
+  tolerance_dir: data/processed        # crop disease tolerance CSVs from seed catalogs
   models_dir:    models
+  outputs_dir:   outputs               # plots, SHAP summaries, calibration curves
   logs_dir:      logs
 
 # Crops to build models for (must match 'Crop type' values in the raw data after title-casing)
 crops:
   - Corn
   - Soybean
-  - Potato
+  - Wheat
 
 data:
   test_size:              0.2    # chronological hold-out fraction
   min_samples_per_crop:   100
+  min_weather_samples:    50     # minimum GPS rows to train the weather model
   random_state:           42
   weather_match_max_km:   15.0   # nearest-weather search radius in kilometres
+  # Date quality guard — catches corrupted Excel serials (e.g. year 0204, 1900)
+  # that slip through pd.to_datetime.  Any start_date outside this window is dropped.
+  valid_year_min:         2010
+  valid_year_max:         2030
 
 features:
   # Weather columns produced by build_weather_spore_data.py
@@ -49,16 +62,56 @@ features:
     - precipitation_mm
     - dew_point_min_c
 
+  # Identity / location features — always numeric, no scaling needed for trees
+  # gps_latitude / gps_longitude capture regional disease pressure gradients.
+  # deployment_duration_days = end_date − start_date: longer exposure → more
+  # spore accumulation opportunity (trap-level signal, not weather).
+  identity:
+    - gps_latitude
+    - gps_longitude
+    - deployment_duration_days
+
+  # Categorical features encoded as one-hot dummies inside build_crop_models.py.
+  # 'test' = disease name (Gray Leaf Spot, Tar Spot, …).  Different diseases
+  # respond to weather differently — this is the #1 missing signal.
+  # Dummies are computed per-crop so each model sees only its own diseases.
+  categorical:
+    - test
+
   # NOTE: Spore count is intentionally excluded — it determines the test result
   # and therefore the target label (data leakage). The model must predict risk
   # from environmental features alone so it is useful *before* a trap is read.
 
 model:
-  type:         LogisticRegression
-  class_weight: balanced     # handles positive/negative class imbalance
+  # ── Model type ───────────────────────────────────────────────────────────────
+  # XGBoost    : recommended — captures nonlinear weather interactions, handles
+  #              missing values natively, consistently outperforms linear models.
+  # LogisticRegression : lightweight baseline, fully interpretable coefficients.
+  type: XGBoost
+
+  # ── LogisticRegression params (used when type: LogisticRegression) ──────────
+  class_weight: balanced     # handles class imbalance automatically
   max_iter:     1000
   random_state: 42
   solver:       lbfgs
+
+  # ── XGBoost params (used when type: XGBoost) ────────────────────────────────
+  # scale_pos_weight is computed automatically from training-set class ratio.
+  # All other params below are tuned for a ~3,000-row agricultural dataset.
+  xgboost:
+    # Tuned conservatively to reduce overfitting:
+    # - shallower trees
+    # - larger child-weight
+    # - stronger row/feature subsampling
+    n_estimators:      220
+    max_depth:         3
+    learning_rate:     0.04
+    subsample:         0.7
+    colsample_bytree:  0.7
+    min_child_weight:  10
+    eval_metric:       logloss
+    random_state:      42
+
   cv_folds:     5            # TimeSeriesSplit folds used on the training set
   n_jobs:       1            # parallel CV workers; set to -1 on a multi-core server
 
@@ -82,16 +135,73 @@ model:
   #            optimal × 0.70         recall-constrained
   #                                   decision boundary
   #
-  # min_recall      : fraction of true outbreaks the model MUST catch.
-  #                   0.90 → "miss at most 1 in 10 outbreaks".
-  #                   0.95 → "miss at most 1 in 20 outbreaks" (more false alarms).
-  #                   VALIDATE with agronomist / crop protection specialist.
-  #                   Recommended starting point: 0.90.
-  # medium_band_factor : MEDIUM band occupies [optimal × factor, optimal).
-  #                   0.70 means the uncertain zone is the bottom 30 % of the
-  #                   decision threshold.
-  min_recall:          0.90
-  medium_band_factor:  0.70
+  # min_recall         : fraction of true outbreaks the model MUST catch.
+  #                      0.90 → "miss at most 1 in 10 outbreaks".
+  #                      0.95 → "miss at most 1 in 20 outbreaks" (more false alarms).
+  #                      VALIDATE with agronomist / crop protection specialist.
+  #                      Recommended starting point: 0.90.
+  # medium_band_factor : controls the LOW/MEDIUM boundary.
+  #                      tau_low = tau* × medium_band_factor
+  #                      0.70 → MEDIUM band spans the bottom 30 % of tau*.
+  #                      This is a business/operational parameter — adjust with
+  #                      the client to match how early they want a "watch" advisory.
+  #                      Increasing toward 1.0 narrows MEDIUM; decreasing widens it.
+  min_recall:           0.90
+  medium_band_factor:   0.70
+
+  # ── Probability calibration ──────────────────────────────────────────────
+  # XGBoost's raw output scores are well-ranked (high AUC) but poorly calibrated
+  # as probabilities: a score of 0.72 often means 55% real risk, not 72%.
+  # After fitting XGBoost on X_fit, an isotonic (or sigmoid) calibrator is
+  # trained on a chronological held-out slice X_cal.  The calibrated wrapper is
+  # what gets saved to disk and used in production.
+  #
+  # With calibrated probabilities:
+  #   • prob = 0.60 genuinely means "60 % of similar situations had disease"
+  #   • The precision-floor MEDIUM band has an honest statistical meaning
+  #   • Threshold JSON values are interpretable to agronomists without caveats
+  #
+  # cal_size        : fraction of training set reserved for calibration.
+  #                   Chronologically the MOST RECENT cal_size rows — so the
+  #                   calibrator sees data closer to the deployment distribution.
+  # method          : isotonic (flexible, needs ≥ 50 samples)
+  #                   sigmoid  (Platt scaling, reliable on smaller sets)
+  #                   auto     (isotonic if ≥ 50 cal samples, sigmoid otherwise)
+  # min_cal_samples : skip calibration rather than fit on fewer samples.
+  calibration:
+    enabled:          true
+    method:           auto
+    cal_size:         0.20
+    min_cal_samples:  30
+
+# ── Baseline comparison ──────────────────────────────────────────────────────
+# When enabled, LogisticRegression is trained first on the same data and its
+# metrics are written to the results CSV alongside XGBoost.
+# The production model saved to disk is always the primary model (type above).
+# Baseline is saved as models/<crop>_model_baseline.pkl for reference.
+baseline:
+  enabled: true
+
+# ── Explainability (SHAP) ────────────────────────────────────────────────────
+# SHAP feature importance is computed after each model is trained and saved
+# as a PNG in outputs_dir.  Requires: pip install shap
+explainability:
+  enabled: true          # set to false to skip (saves ~30s per crop)
+  max_display: 20        # top N features to show in the summary plot
+
+# ── Prediction logging ───────────────────────────────────────────────────────
+# Every call to Predictor.predict() is appended to a CSV for monitoring,
+# drift detection, and audit trail.
+prediction_logging:
+  enabled:  true
+  log_file: logs/predictions.csv
+
+# Inference governance:
+# - false (recommended): fail fast if threshold JSON artifacts are missing
+# - true: allow conservative fallback thresholds (dev/test only)
+prediction:
+  allow_threshold_fallback: false
+  model_selection_file: models/model_selection.json
 
 variety_matching:
   fuzzy_threshold:  80       # fuzz.token_set_ratio minimum score (0–100)

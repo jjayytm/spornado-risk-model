@@ -1,0 +1,35 @@
+{
+  "crop": "Soybean",
+  "model": "temporal",
+  "feature_set": "temporal + deployment_duration + disease (all rows)",
+  "data_subset": "all rows",
+  "n_features": 6,
+  "temporal_features": [
+    "month",
+    "day_of_year",
+    "week_of_year"
+  ],
+  "duration_features": [
+    "deployment_duration_days"
+  ],
+  "disease_features": [
+    "disease_frogeye_leaf_spot",
+    "disease_white_mold"
+  ],
+  "calibrated": true,
+  "calibration_method": "isotonic",
+  "calibration_samples": 74,
+  "optimal": 0.6819,
+  "low_max": 0.6719,
+  "low_max_source": "precision_floor",
+  "precision_floor_used": 0.99,
+  "base_rate": 0.8925,
+  "high_min": 0.6819,
+  "achieved_recall": 0.9277,
+  "achieved_precision": 0.9277,
+  "min_recall_target": 0.9,
+  "recall_shortfall": false,
+  "youden": 1.0,
+  "medium_band_factor": 0.7,
+  "derivation": "Recall-constrained: >=90% recall (achieved 92.8%) with max precision (92.8%) on all-rows chronological hold-out. MEDIUM low_max from precision_floor."
+}

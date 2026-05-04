@@ -96,6 +96,10 @@ local_config.yaml
 secrets.yaml
 .env.local
 
+# Local-only PDFs in docs/ (repo tracks Disease_Risk_Thresholds_Methodology.pdf only)
+docs/spornado scope.pdf
+docs/spornado_threshold_document.pdf
+
 # Office documents — keep locally, never commit to GitHub
 *.docx
 *.doc
